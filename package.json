@@ -7,6 +7,7 @@
 	"shortname": "openlp",
 	"main": "index.js",
 	"scripts": {
+		"package": "companion-module-build",
 		"test": "echo \"Error: no test specified\" && exit 1"
 	},
 	"keywords": [
@@ -24,5 +25,9 @@
 		"type": "git",
 		"url": "git+https://github.com/bitfocus/companion-module-openlp-http.git"
 	},
-	"api_version": "1.0.0"
+	"api_version": "1.0.0",
+	"dependencies": {
+		"@companion-module/base": "^1.13.2",
+		"ws": "^8.16.0"
+	}
 }

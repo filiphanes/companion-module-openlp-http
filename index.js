@@ -1,10 +1,18 @@
-const instance_skel = require('../../instance_skel')
-const upgradeScripts = require('./upgrades')
+const { InstanceBase, runEntrypoint, InstanceStatus } = require('@companion-module/base')
+const UpgradeScripts = require('./upgrades')
 const WebSocket = require('ws')
 
-class instance extends instance_skel {
-  constructor(system, id, config) {
-    super(system, id, config)
+function rgb(r, g, b) {
+  return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('')
+}
+
+class ModuleInstance extends InstanceBase {
+	constructor(internal) {
+		super(internal)
+	}
+
+async init(config) {
+		this.config = config
 
     this.choices_mode = [
       { label: 'Show', id: 'show' },
@@ -45,10 +53,37 @@ class instance extends instance_skel {
         action: 'next',
       },
     ]
+
+    this.updateStatus(InstanceStatus.Connecting, 'Initializing')
+    this.initVariables()
+    this.initActions()
+    this.initPresets()
+    this.initFeedbacks()
+
+    this.service_increment = -1 // incremental version counter
+    this.current_si = -1 // counted from 0
+    this.current_slide = -1 // counted from 0
+    this.current_si_uid = 'asdf' // current service item
+    this.v3_service_list_data = [] // for switching SI in v3
+    this.mode = -1
+
+    if (this.config.ip) {
+      if (this.config.version == 'v3') {
+        this.config.port = 4316
+        this.initV3()
+      } else {
+        this.initV2()
+      }
+    } else {
+      this.updateStatus(InstanceStatus.BadConfig, 'No host configured')
+    }
+
+    this.auth_error = false
+    this.polling = true
   }
 
   // Return config fields for web config
-  config_fields = () => {
+  getConfigFields() {
     return [
       {
         type: 'dropdown',
@@ -81,20 +116,6 @@ class instance extends instance_skel {
         isVisible: (configValues) => configValues.version === 'v2',
       },
       {
-        type: 'text',
-        id: 'info1',
-        width: 12,
-        label: '',
-        value: '<br>',
-      },
-      {
-        type: 'text',
-        id: 'info2',
-        width: 12,
-        label: 'Optional Auth Settings',
-        value: '',
-      },
-      {
         type: 'textinput',
         id: 'username',
         label: 'Username',
@@ -109,20 +130,6 @@ class instance extends instance_skel {
         width: 5,
       },
       {
-        type: 'text',
-        id: 'info3',
-        width: 12,
-        label: '',
-        value: '<br>',
-      },
-      {
-        type: 'text',
-        id: 'info4',
-        width: 12,
-        label: 'Service list fetching',
-        value: 'Specify how many items fetch into variables si_#, slide_# and slide_tag_#',
-      },
-      {
         type: 'number',
         id: 'serviceItemLimit',
         label: 'Service items max count',
@@ -130,17 +137,17 @@ class instance extends instance_skel {
         tooltip: 'Number of service items fetched into variables',
         width: 4,
         min: 0,
-        max: 20,
+        max: 50,
       },
       {
         type: 'number',
         id: 'slideItemLimit',
         label: 'Slides max count',
         default: 12,
-        tooltip: 'Number or slides fetched into variables',
+        tooltip: 'Number of slides fetched into variables',
         width: 4,
         min: 0,
-        max: 20,
+        max: 50,
       },
       {
         type: 'textinput',
@@ -153,64 +160,33 @@ class instance extends instance_skel {
     ]
   }
 
-  init = () => {
-    //this.status(this.STATUS_WARNING, 'Initializing')
-    this.init_variables()
-    this.init_actions()
-    this.init_presets()
-    this.init_feedbacks()
-
-    this.service_increment = -1 // incremental version counter
-    this.current_si = -1 // counted from 0
-    this.current_slide = -1 // counted from 0
-    this.current_si_uid = 'asdf' // current service item
-    this.v3_service_list_data = [] // for switching SI in v3
-    this.mode = -1
-
-    if (this.config.ip) {
-      if (this.config.version == 'v3') {
-        this.config.port = 4316
-        this.initV3()
-      } else {
-        this.initV2()
+  async initV3() {
+    try {
+      const res = await fetch('http://' + this.config.ip + ':' + this.config.port + '/api/v2/core/system', {
+        headers: { 'Content-Type': 'application/json' }
+      })
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
       }
-    } else {
-      this.status(this.STATUS_WARNING, 'No host configured')
-    }
-
-    this.auth_error = false
-    this.polling = true
-  }
-
-  initV3 = () => {
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/v2/core/system',
-      (err, result) => {
-        if (err !== null) {
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
+      const data = await res.json()
+      this.initWebSocket(data.websocket_port)
+      if (data.login_required) {
+        if (!this.config.username || !this.config.password) {
+          this.log('error', 'Please update user/password in module config, remote management requires authentication')
         } else {
-          this.initWebSocket(result.data.websocket_port)
-          if (result.data.login_required) {
-            if (!this.config.username || !this.config.password) {
-              this.log(
-                'error',
-                'Please update user/password in module config, remote management requires authentication'
-              )
-            } else {
-              this.loginV3()
-            }
-          }
+          this.loginV3()
         }
       }
-    )
+    } catch (err) {
+      this.updateStatus(InstanceStatus.ConnectionFailure, `${err.message}`)
+      this.log('error', 'HTTP GET Request failed (' + err.message + ')')
+    }
   }
 
-  initWebSocket = (websocket_port) => {
-    this.status(this.STATUS_UNKNOWN)
+  initWebSocket(websocket_port) {
+    this.updateStatus(InstanceStatus.Connecting)
     if (!websocket_port) {
-      this.status(this.STATUS_ERROR, 'Configuration error - no WebSocket port defined')
+      this.updateStatus(InstanceStatus.BadConfig, 'Missing WebSocket port')
       return
     }
 
@@ -222,11 +198,11 @@ class instance extends instance_skel {
 
     this.ws.on('open', () => {
       this.log('debug', 'Connection opened via WS')
-      this.status(this.STATUS_OK)
+      this.updateStatus(InstanceStatus.Ok)
     })
     this.ws.on('close', (code) => {
       this.log('debug', `Connection closed with code ${code}`)
-      this.status(this.STATUS_ERROR, `Connection closed with code ${code}`)
+      this.updateStatus(InstanceStatus.ConnectionFailure, `Connection closed with code ${code}`)
     })
 
     this.ws.on('message', this.interpretPollData)
@@ -236,28 +212,29 @@ class instance extends instance_skel {
     })
   }
 
-  loginV3 = () => {
-    this.system.emit(
-      'rest',
-      `http://${this.config.ip}:${this.config.port}/api/v2/core/login`,
-      { username: this.config.username, password: this.config.password },
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', `Login failed (${result.error.code})`)
-          this.status(this.STATUS_ERROR, result.error.code)
-        } else if (result.response.statusCode != 200) {
-          this.log('error', `Login failed (${result.response.statusCode})`)
-          this.status(this.STATUS_ERROR, result.response.statusMessage)
-        } else {
-          this.status(this.STATUS_OK)
-          this.token = result.data.token
-        }
-      },
-      {}
-    )
+async loginV3() {
+    try {
+      const res = await fetch(`http://${this.config.ip}:${this.config.port}/api/v2/core/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: this.config.username, password: this.config.password }),
+      })
+      const result = await res.json()
+      if (!res.ok) {
+        this.log('error', `Login failed (${res.status})`)
+        this.updateStatus(InstanceStatus.AuthenticationFailure, `Login failed (${res.status})`)
+      } else {
+        this.updateStatus(InstanceStatus.Ok)
+        this.token = result.token
+      }
+    } catch (err) {
+      this.log('error', `Login failed (${err.message})`)
+      this.updateStatus(InstanceStatus.AuthenticationFailure, `Login failed (${err.message})`)
+    }
   }
 
-  destroy = () => {
+	// When module gets deleted
+	async destroy() {
     clearInterval(this.pollingInterval)
 
     if (this.ws !== undefined) {
@@ -265,61 +242,76 @@ class instance extends instance_skel {
       delete this.ws
     }
 
-    this.status(this.STATUS_UNKNOWN, 'Disabled')
-    this.debug('destroy')
+    this.updateStatus(InstanceStatus.Disconnected)
   }
 
-  throw401Warning = () => {
+  throw401Warning() {
     this.log('error', 'Remote management requires authentication')
-    this.status(this.STATUS_WARNING, 'Limited connection, only variables will work. Login is required.')
+    this.updateStatus(InstanceStatus.UnknownWarning, 'Limited connection, only variables will work. Login is required.')
   }
 
-  initV2 = () => {
+  initV2() {
     this.pollingInterval = setInterval(() => {
       this.poll()
     }, 500)
   }
 
-  init_variables = () => {
+  initVariables() {
+    const serviceItemLimit = this.config.serviceItemLimit ?? 7
+    const slideItemLimit = this.config.slideItemLimit ?? 12
+
     const vars = [
       {
-        label: 'Current display mode',
-        name: 'display_mode',
+        variableId: 'display_mode',
+        name: 'Current display mode',
       },
       {
-        name: 'slide',
-        label: 'Current slide number',
+        variableId: 'slide',
+        name: 'Current slide number',
       },
       {
-        name: 'slide_tag',
-        label: 'Current slide tag',
+        variableId: 'slide_current',
+        name: 'Current slide text',
       },
       {
-        name: 'service_item',
-        label: 'Current service item',
+        variableId: 'slide_next',
+        name: 'Next slide text',
       },
       {
-        name: 'slides_cnt',
-        label: 'Number of slides in current service item',
+        variableId: 'slide_tag',
+        name: 'Current slide tag',
+      },
+      {
+        variableId: 'service_item',
+        name: 'Current service item',
+      },
+      {
+        variableId: 'service_cnt',
+        name: 'Number of service items',
+      },
+      {
+        variableId: 'slides_count',
+        name: 'Number of slides in current service item',
+      },
+      {
+        variableId: 'screen_hidden',
+        name: 'Screen is hidden/blank',
       },
     ]
 
-    for (let i = 1; i <= this.config.serviceItemLimit; i++) {
-      vars.push({ name: `si_${i}`, label: `${i}. service item` })
-      //vars.push({ name: `si_${i}_short`, label: `${i}. service item short` })
-      //vars.push({ name: `si_${i}_type`, label: `${i}. service item type` })
-      //vars.push({ name: `si_${i}_selected`, label: `${i}. service item selected state` })
+    for (let i = 1; i <= serviceItemLimit; i++) {
+      vars.push({ variableId: `si_${i}`, name: `${i}. service item` })
     }
 
-    for (let i = 1; i <= this.config.slideItemLimit; i++) {
-      vars.push({ name: `slide_${i}`, label: `${i}. slide` })
-      vars.push({ name: `slide_tag_${i}`, label: `${i}. slide tag` })
+    for (let i = 1; i <= slideItemLimit; i++) {
+      vars.push({ variableId: `slide_${i}`, name: `${i}. slide` })
+      vars.push({ variableId: `slide_tag_${i}`, name: `${i}. slide tag` })
     }
 
     this.setVariableDefinitions(vars)
   }
 
-  init_presets = () => {
+  initPresets() {
     let presets = this.choices_progress.map((a) => {
       return {
         category: 'Service items & Slides',
@@ -328,8 +320,8 @@ class instance extends instance_skel {
           style: 'text',
           text: a.button_label,
           size: 18,
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(0, 0, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(0, 0, 0),
         },
         actions: [
           {
@@ -348,8 +340,8 @@ class instance extends instance_skel {
           style: 'text',
           size: '14',
           text: i + ' $(openlp:si_' + i + ')',
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(0, 0, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(0, 0, 0),
         },
         actions: [
           {
@@ -364,8 +356,8 @@ class instance extends instance_skel {
               si: i,
             },
             style: {
-              bgcolor: this.rgb(255, 0, 0),
-              color: this.rgb(255, 255, 255),
+              bgcolor: rgb(255, 0, 0),
+              color: rgb(255, 255, 255),
             },
           },
         ],
@@ -379,8 +371,8 @@ class instance extends instance_skel {
         bank: {
           style: 'text',
           text: 'Slide $(openlp:slide_tag_' + i + ')',
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(0, 0, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(0, 0, 0),
         },
         actions: [
           {
@@ -395,8 +387,8 @@ class instance extends instance_skel {
               slide: i,
             },
             style: {
-              bgcolor: this.rgb(255, 0, 0),
-              color: this.rgb(255, 255, 255),
+              bgcolor: rgb(255, 0, 0),
+              color: rgb(255, 255, 255),
             },
           },
         ],
@@ -411,8 +403,8 @@ class instance extends instance_skel {
           style: 'text',
           size: 18,
           text: mode.label,
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(0, 51, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(0, 51, 0),
         },
         actions: [
           {
@@ -429,8 +421,8 @@ class instance extends instance_skel {
               mode: mode.id,
             },
             style: {
-              color: this.rgb(255, 255, 255),
-              bgcolor: this.rgb(255, 0, 0),
+              color: rgb(255, 255, 255),
+              bgcolor: rgb(255, 0, 0),
             },
           },
         ],
@@ -443,8 +435,8 @@ class instance extends instance_skel {
       bank: {
         style: 'text',
         text: 'Toggle $(openlp:display_mode)',
-        color: this.rgb(255, 255, 255),
-        bgcolor: this.rgb(0, 0, 0),
+        color: rgb(255, 255, 255),
+        bgcolor: rgb(0, 0, 0),
       },
       actions: [
         {
@@ -459,7 +451,7 @@ class instance extends instance_skel {
             mode: 'show',
           },
           style: {
-            color: this.rgb(255, 0, 0),
+            color: rgb(255, 0, 0),
           },
         },
         {
@@ -468,7 +460,7 @@ class instance extends instance_skel {
             mode: 'blank',
           },
           style: {
-            color: this.rgb(125, 125, 125),
+            color: rgb(125, 125, 125),
           },
         },
       ],
@@ -479,23 +471,20 @@ class instance extends instance_skel {
 
   static GetUpgradeScripts() {
     return [
-      instance_skel.CreateConvertToBooleanFeedbackUpgradeScript({
-        mode: true,
-      }),
-      upgradeScripts.updates013,
-      upgradeScripts.updates016,
+      UpgradeScripts.updates013,
+      UpgradeScripts.updates016,
     ]
   }
 
-  init_feedbacks = () => {
+  initFeedbacks() {
     const feedbacks = {
       mode: {
         type: 'boolean',
         label: 'Display mode',
         description: 'If the display in defined mode, change style of the bank',
         style: {
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(0, 0, 255),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(0, 0, 255),
         },
         options: [
           {
@@ -515,8 +504,8 @@ class instance extends instance_skel {
         label: 'Service item on specified slide',
         description: 'If specific slide is active, change style of the bank',
         style: {
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(255, 0, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(255, 0, 0),
         },
         options: [
           {
@@ -536,8 +525,8 @@ class instance extends instance_skel {
         label: 'Service item active',
         description: 'If specific service item is active, change style of the bank',
         style: {
-          color: this.rgb(255, 255, 255),
-          bgcolor: this.rgb(255, 0, 0),
+          color: rgb(255, 255, 255),
+          bgcolor: rgb(255, 0, 0),
         },
         options: [
           {
@@ -557,14 +546,34 @@ class instance extends instance_skel {
     this.setFeedbackDefinitions(feedbacks)
   }
 
-  init_actions = () => {
+  initActions() {
+    const action = (this.config.version == 'v3')
+      ? this.actionV3
+      : this.actionV2;
+
     const actions = {
-      next: { label: 'Next Slide' },
-      previous: { label: 'Previous Slide' },
-      nextSi: { label: 'Next Service item' },
-      prevSi: { label: 'Prev Service item' },
+      next: {
+        name: 'Next Slide',
+        options: [],
+        callback: action,
+      },
+      previous: {
+        name: 'Previous Slide',
+        options: [],
+        callback: action,
+      },
+      nextSi: {
+        name: 'Next Service item',
+        options: [],
+        callback: action,
+      },
+      prevSi: {
+        name: 'Prev Service item',
+        options: [],
+        callback: action,
+      },
       mode: {
-        label: 'Display mode',
+        name: 'Display mode',
         options: [
           {
             type: 'dropdown',
@@ -575,9 +584,10 @@ class instance extends instance_skel {
             minChoicesForSearch: 0,
           },
         ],
+        callback: action,
       },
       gotoSi: {
-        label: 'Specific Service item',
+        name: 'Specific Service item',
         options: [
           {
             type: 'number',
@@ -587,9 +597,10 @@ class instance extends instance_skel {
             default: 1,
           },
         ],
+        callback: action,
       },
       gotoSlide: {
-        label: 'Specific Slide (in current Service item)',
+        name: 'Specific Slide (in current Service item)',
         options: [
           {
             type: 'number',
@@ -599,31 +610,26 @@ class instance extends instance_skel {
             default: 1,
           },
         ],
+        callback: action,
       },
     }
 
     if (this.config.version == 'v2') {
       actions.refreshSiList = {
-        label: 'Refresh Service items list',
+        name: 'Refresh Service items list',
+        options: [],
+        callback: action,
       }
     }
 
-    this.setActions(actions)
+    this.setActionDefinitions(actions)
   }
 
-  action = (action) => {
-    if (this.config.version == 'v3') {
-      this.actionV3(action)
-    } else {
-      this.actionV2(action)
-    }
-  }
-
-  actionV2 = (action) => {
-    let urlAction = ''
-    switch (action.action) {
+  async actionV2(action) {
+    let path = ''
+    switch (action.actionId) {
       case 'gotoSi':
-        urlAction = 'service/set?data=' + JSON.stringify({ request: { id: Number(action.options.si - 1) } })
+        path = 'service/set?data=' + JSON.stringify({ request: { id: Number(action.options.si - 1) } })
         break
       case 'refreshSiList':
         this.fetchServiceListV2()
@@ -633,34 +639,41 @@ class instance extends instance_skel {
         if (action.options.mode == 'toggle') {
           path = this.display_mode == 'blank' ? 'show' : 'blank'
         }
-        urlAction = 'display/' + path
+        path = 'display/' + path
         break
       case 'nextSi':
-        urlAction = 'service/next'
+        path = 'service/next'
         break
       case 'prevSi':
-        urlAction = 'service/previous'
+        path = 'service/previous'
         break
       case 'next':
-        urlAction = 'controller/live/next'
+        path = 'controller/live/next'
         break
       case 'previous':
-        urlAction = 'controller/live/previous'
+        path = 'controller/live/previous'
         break
       case 'gotoSlide':
-        if (action.options.slide > this.slides_cnt) {
+        if (action.options.slide > this.slides_count) {
           return
         }
-        urlAction = 'controller/live/set?data=' + JSON.stringify({ request: { id: Number(action.options.slide - 1) } })
+        path = 'controller/live/set?data=' + JSON.stringify({ request: { id: Number(action.options.slide - 1) } })
         break
     }
-    const url = 'http://' + this.config.ip + ':' + this.config.port + '/api/' + urlAction
-    //console.log(url)
-    this.system.emit('rest_get', url, this.interpretActionResult, this.headersV2())
-    this.polling = true // Turn on polling when a command has been sent - will be turned off again elsewhere e.g. if OpenLP is not running
+    const url = `http://${this.config.ip}:${this.config.port}/api/${path}`
+    try {
+      await fetch(url, { headers: this.headersV2() })
+      this.auth_error = false
+      this.updateStatus(InstanceStatus.Ok)
+    } catch (err) {
+      this.log('error', `HTTP Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, `HTTP Request returned ${err.message || 'unknown'}`)
+      this.polling = false
+    }
+    this.polling = true
   }
 
-  headersV3 = () => {
+  headersV3() {
     const headers = {}
     if (this.isSecure && this.token) {
       headers['Authorization'] = this.token
@@ -668,18 +681,18 @@ class instance extends instance_skel {
     return headers
   }
 
-  actionV3 = (action) => {
+  async actionV3(action) {
     if (this.isSecure && !this.token) {
       this.throw401Warning()
       return
     }
 
-    let urlAction = ''
+    let path = ''
     let param = {}
 
-    switch (action.action) {
+    switch (action.actionId) {
       case 'mode':
-        urlAction = 'core/display'
+        path = 'core/display'
         param = {
           display: action.options.mode,
         }
@@ -688,103 +701,59 @@ class instance extends instance_skel {
         }
         break
       case 'nextSi':
-        urlAction = 'service/progress'
+        path = 'service/progress'
         param = {
           action: 'next',
         }
         break
       case 'prevSi':
-        urlAction = 'service/progress'
+        path = 'service/progress'
         param = {
           action: 'previous',
         }
         break
       case 'next':
-        urlAction = 'controller/progress'
+        path = 'controller/progress'
         param = {
           action: 'next',
         }
         break
       case 'previous':
-        urlAction = 'controller/progress'
+        path = 'controller/progress'
         param = {
           action: 'previous',
         }
         break
       case 'gotoSlide':
-        if (action.options.slide > this.slides_cnt) {
+        if (action.options.slide > this.slides_count) {
           return
         }
-        urlAction = 'controller/show'
+        path = 'controller/show'
         param = { id: action.options.slide - 1 }
         break
       case 'gotoSi':
-        urlAction = 'service/show'
+        path = 'service/show'
         param = { id: this.v3_service_list_data[action.options.si - 1].id }
         break
     }
 
-    const url = `http://${this.config.ip}:${this.config.port}/api/v2/${urlAction}`
-    //console.log(url, param)
-    this.system.emit('rest', url, param, this.interpretActionResult, this.headersV3())
-  }
-
-  interpretActionResult = (err, result) => {
-    if (err !== null) {
-      this.log('error', 'HTTP Request failed (' + result.error.code + ')')
-      this.status(this.STATUS_ERROR, result.error.code)
-      this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-    } else {
-      if (result.response.statusCode == 401) {
-        this.auth_error = true
-        this.status(this.STATUS_ERROR, 'Authorization failed. Please check username and password.')
-      } else if (result.response.statusCode != 200 && result.response.statusCode != 204) {
-        this.status(this.STATUS_ERROR, 'Got status code ' + result.response.statusCode + ' from OpenLP.')
-      } else {
-        this.auth_error = false
-        this.status(this.STATUS_OK)
-      }
+    const url = `http://${this.config.ip}:${this.config.port}/api/v2/${path}`
+    try {
+      await fetch(url, {
+        method: 'POST',
+        headers: this.headersV3(),
+        body: JSON.stringify(param),
+      })
+      this.auth_error = false
+      this.updateStatus(InstanceStatus.Ok)
+    } catch (err) {
+      this.log('error', `HTTP Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, `HTTP Request returned ${err.message || 'unknown'}`)
+      this.polling = false
     }
   }
 
-  updateConfig = (config) => {
-    this.config = config
-    clearInterval(this.pollingInterval)
-    this.init()
-  }
-
-  poll = () => {
-    // no config set yet - so no polling
-    if (!this.config.ip && !this.config.port) {
-      return
-    }
-
-    // No polling if earlier communication with OpenLP failed, e.g. if OpenLP is not running
-    if (!this.polling) {
-      return
-    }
-
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/poll',
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-        } else {
-          /* polling does not need auth and no auth error is triggered. But we do not want to override the error */
-          if (!this.auth_error) {
-            this.status(this.STATUS_OK)
-          }
-          this.interpretPollData(result.data.results)
-        }
-      },
-      this.headersV2()
-    )
-  }
-
-  headersV2 = () => {
+headersV2() {
     const headers = {}
     if (this.config.username && this.config.password) {
       headers['Authorization'] =
@@ -793,7 +762,36 @@ class instance extends instance_skel {
     return headers
   }
 
-  interpretPollData = (data) => {
+  async configUpdated(config) {
+    this.config = config
+    clearInterval(this.pollingInterval)
+    await this.init()
+  }
+
+  async poll() {
+    if (!this.config.ip && !this.config.port) {
+      return
+    }
+
+    if (!this.polling) {
+      return
+    }
+
+    try {
+      const res = await fetch(
+        'http://' + this.config.ip + ':' + this.config.port + '/api/poll',
+        { headers: this.headersV2() }
+      )
+      const data = await res.json()
+      this.interpretPollData(data.results)
+    } catch (err) {
+      this.log('error', `HTTP GET Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, err.message)
+      this.polling = false
+    }
+  }
+
+  interpretPollData(data) {
     if (this.config.version == 'v3') {
       let msgValue = null
       try {
@@ -819,26 +817,28 @@ class instance extends instance_skel {
     this.current_slide = data.slide
     this.service_increment = data.service
     this.current_si_uid = data.item
-    this.setVariable('slide', data.slide + 1)
+    this.setVariableValues({ slide: data.slide + 1 })
 
     if (chkFbkSlide) {
       this.checkFeedbacks('fbk_slide')
     }
 
     let mode = 'Show'
+    let screenHidden = false
     if (data.blank) {
       mode = 'Blank'
+      screenHidden = true
     } else if (data.display) {
       mode = 'Desktop'
     } else if (data.theme) {
       mode = 'Theme'
     }
     this.display_mode = mode.toLowerCase()
-    this.setVariable('display_mode', mode)
+    this.setVariableValues({ display_mode: mode, screen_hidden: screenHidden })
     this.checkFeedbacks('mode')
   }
 
-  fetchCurrentServiceList = () => {
+  fetchCurrentServiceList() {
     if (this.config.version == 'v3') {
       this.fetchServiceListV3()
     } else {
@@ -846,54 +846,52 @@ class instance extends instance_skel {
     }
   }
 
-  fetchServiceListV2 = () => {
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/service/list',
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-        } else {
-          this.interpretServiceListData(result.data.results.items)
-        }
-      },
-      this.headersV2()
-    )
-  }
-  fetchServiceListV3 = () => {
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/v2/service/items',
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-        } else {
-          this.v3_service_list_data = result.data
-          this.interpretServiceListData(result.data)
-        }
-      },
-      this.headersV3()
-    )
+  async fetchServiceListV2() {
+    try {
+      const res = await fetch(
+        'http://' + this.config.ip + ':' + this.config.port + '/api/service/list',
+        { headers: this.headersV2() }
+      )
+      const data = await res.json()
+      this.interpretServiceListData(data.results.items)
+    } catch (err) {
+      this.log('error', `HTTP GET Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, err.message)
+      this.polling = false
+    }
   }
 
-  interpretServiceListData = (items) => {
+  async fetchServiceListV3() {
+    try {
+      const res = await fetch(
+        'http://' + this.config.ip + ':' + this.config.port + '/api/v2/service/items',
+        { headers: this.headersV3() }
+      )
+      const data = await res.json()
+      this.v3_service_list_data = data
+      this.interpretServiceListData(data)
+    } catch (err) {
+      this.log('error', `HTTP GET Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, err.message)
+      this.polling = false
+    }
+  }
+
+  interpretServiceListData(items) {
     if (!Array.isArray(items)) return
+    this.setVariableValues({ service_cnt: items.length })
     items.forEach((si, i) => {
-      this.setVariable(`si_${i + 1}`, si.title)
+      this.setVariableValues({ [`si_${i + 1}`]: si.title })
       //this.setVariable(`si_${i + 1}_short`, si.title.substr(0, 15))
       //this.setVariable(`si_${i + 1}_type`, si.plugin)
       if (si.selected) {
         this.current_si = i
-        this.setVariable('service_item', si.title)
+        this.setVariableValues({ service_item: si.title })
         //this.setVariable(`current_si_short`, si.title.substr(0, 15))
       }
     })
     for (let i = items.length + 1; i <= this.config.serviceItemLimit; i++) {
-      this.setVariable(`si_${i}`, this.config.serviceItemEmptyText)
+      this.setVariableValues({ [`si_${i}`]: this.config.serviceItemEmptyText })
       //this.setVariable(`si_${i}_short`, this.config.serviceItemEmptyText)
       //this.setVariable(`si_${i}_type`, this.config.serviceItemEmptyText)
     }
@@ -901,65 +899,69 @@ class instance extends instance_skel {
     this.loadSlides()
   }
 
-  loadSlides = () => {
-    this.slides_cnt = 0
+  loadSlides() {
+    this.slides_count = 0
     if (this.config.version == 'v3') {
       this.loadSlidesV3()
     } else {
       this.loadSlidesV2()
     }
   }
-  loadSlidesV2 = () => {
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/controller/live/text',
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-        } else {
-          this.interpretSlideListData(result.data.results.slides)
-        }
-      },
-      this.headersV2()
-    )
-  }
-  loadSlidesV3 = () => {
-    this.system.emit(
-      'rest_get',
-      'http://' + this.config.ip + ':' + this.config.port + '/api/v2/controller/live-items',
-      (err, result) => {
-        if (err !== null) {
-          this.log('error', 'HTTP GET Request failed (' + result.error.code + ')')
-          this.status(this.STATUS_ERROR, result.error.code)
-          this.polling = false // Turn off polling to avoid filling up Companion log e.g. if OpenLP is not running
-        } else {
-          this.interpretSlideListData(result.data.slides)
-        }
-      },
-      this.headersV3()
-    )
+  async loadSlidesV2() {
+    try {
+      const res = await fetch(
+        'http://' + this.config.ip + ':' + this.config.port + '/api/controller/live/text',
+        { headers: this.headersV2() }
+      )
+      const data = await res.json()
+      this.interpretSlideListData(data.results.slides)
+    } catch (err) {
+      this.log('error', `HTTP GET Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, err.message)
+      this.polling = false
+    }
   }
 
-  interpretSlideListData = (slides) => {
+  async loadSlidesV3() {
+    try {
+      const res = await fetch(
+        'http://' + this.config.ip + ':' + this.config.port + '/api/v2/controller/live-items',
+        { headers: this.headersV3() }
+      )
+      const data = await res.json()
+      this.interpretSlideListData(data.slides)
+    } catch (err) {
+      this.log('error', `HTTP GET Request failed (${err.message || 'unknown'})`)
+      this.updateStatus(InstanceStatus.UnknownError, err.message)
+      this.polling = false
+    }
+  }
+
+  interpretSlideListData(slides) {
     if (!Array.isArray(slides)) return
-    this.setVariable('slides_cnt', slides.length)
-    this.slides_cnt = slides.length
+    const updates = { slides_count: slides.length }
+    this.slides_count = slides.length
     slides.forEach((sl, i) => {
-      this.setVariable(`slide_tag_${i + 1}`, sl.tag)
-      this.setVariable(`slide_${i + 1}`, sl.text.substr(0, 19))
+      updates[`slide_tag_${i + 1}`] = sl.tag
+      updates[`slide_${i + 1}`] = sl.text || ''
       if (sl.selected) {
         this.current_slide = i
-        this.setVariable('slide_tag', sl.tag)
+        updates.slide_tag = sl.tag
+        updates.slide_current = sl.text ? sl.text : ''
+        // Set next slide text
+        const nextSlide = slides[i + 1]
+        updates.slide_next = nextSlide ? (nextSlide.text || '').substr(0, 19) : ''
       }
     })
     for (let i = slides.length + 1; i <= this.config.slideItemLimit; i++) {
-      this.setVariable(`slide_tag_${i}`, this.config.serviceItemEmptyText)
-      this.setVariable(`slide_${i}`, this.config.serviceItemEmptyText)
+      updates[`slide_tag_${i}`] = this.config.serviceItemEmptyText
+      updates[`slide_${i}`] = this.config.serviceItemEmptyText
     }
+    this.setVariableValues(updates)
     this.checkFeedbacks('fbk_slide')
   }
+
 }
 
-exports = module.exports = instance
+runEntrypoint(ModuleInstance, UpgradeScripts)
+

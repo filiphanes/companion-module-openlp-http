@@ -802,6 +802,7 @@ headersV2() {
       data = msgValue.results
     }
     this.isSecure = data.isSecure
+    this.updateStatus(InstanceStatus.Ok)
     //console.log(data)
     let chkFbkSlide = false
     if (data.slide != this.current_slide) {
@@ -814,13 +815,19 @@ headersV2() {
     }
 
     // for proper feedback
+    const slideChanged = this.current_slide !== data.slide
     this.current_slide = data.slide
     this.service_increment = data.service
     this.current_si_uid = data.item
     this.setVariableValues({ slide: data.slide + 1 })
 
-    if (chkFbkSlide) {
+    if (chkFbkSlide || slideChanged) {
       this.checkFeedbacks('fbk_slide')
+    }
+
+    // Reload slides when slide changes to update slide_current
+    if (slideChanged) {
+      this.loadSlides()
     }
 
     let mode = 'Show'

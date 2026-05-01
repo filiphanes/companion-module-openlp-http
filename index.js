@@ -67,7 +67,7 @@ async init(config) {
     this.v3_service_list_data = [] // for switching SI in v3
     this.mode = -1
 
-    if (this.config.ip) {
+    if (this.config && this.config.ip) {
       if (this.config.version == 'v3') {
         this.config.port = 4316
         this.initV3()
@@ -257,8 +257,9 @@ async loginV3() {
   }
 
   initVariables() {
-    const serviceItemLimit = this.config.serviceItemLimit ?? 7
-    const slideItemLimit = this.config.slideItemLimit ?? 12
+    const config = this.config || {}
+    const serviceItemLimit = config.serviceItemLimit ?? 7
+    const slideItemLimit = config.slideItemLimit ?? 12
 
     const vars = [
       {

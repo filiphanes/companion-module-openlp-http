@@ -287,7 +287,7 @@ async loginV3() {
         name: 'Current service item',
       },
       {
-        variableId: 'service_cnt',
+        variableId: 'service_count',
         name: 'Number of service items',
       },
       {
@@ -887,7 +887,7 @@ headersV2() {
 
   interpretServiceListData(items) {
     if (!Array.isArray(items)) return
-    this.setVariableValues({ service_cnt: items.length })
+    this.setVariableValues({ service_count: items.length })
     items.forEach((si, i) => {
       this.setVariableValues({ [`si_${i + 1}`]: si.title })
       //this.setVariable(`si_${i + 1}_short`, si.title.substr(0, 15))
